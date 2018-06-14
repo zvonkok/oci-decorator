@@ -29,6 +29,11 @@
 
 #include <libconfig.h++>
 
+#include <rapidjson/document.h>
+
+#include "oci-decorator.h"
+
+
 #define _cleanup_(x) __attribute__((cleanup(x)))
 
 
@@ -74,6 +79,11 @@ DEFINE_CLEANUP_FUNC(yajl_val, yajl_tree_free)
 using namespace std;
 using namespace libconfig;
 
+namespace rd = ::rapidjson;
+
+fstream lg;
+
+
 string shortid(const string & id)
 {
 	return id.substr(0, 12);
@@ -81,11 +91,12 @@ string shortid(const string & id)
 
 void read_directory(const string & name, vector<string> & v)
 {
-       _cleanup_dir_ DIR* dirp = opendir(name.c_str());
+        DIR* dirp = opendir(name.c_str());
         struct dirent * dp;
         while ((dp = readdir(dirp)) != NULL) {
                 v.push_back(dp->d_name);
         }
+        closedir(dirp);
 }
 
 long GetFileSize(std::string filename)
@@ -325,7 +336,7 @@ static int32_t prestart(const string & id,
  * Return the complete json string.
  */
 
-string get_json_string(std::istream& from)
+static string get_json_string(std::istream& from)
 {
         string json_string;
         string input_line;
@@ -337,157 +348,139 @@ string get_json_string(std::istream& from)
         return json_string;
 }
 
-static int32_t parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, string & rootfs)
+static bool get_config_from_bundle(string & bundle, string & config)
 {
-	yajl_val node = *node_ptr;
-	char errbuf[BUFLEN];
-	string config_data;
-	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
+        bundle.append("/config.json");
+        fstream from_bundle(bundle.c_str(), fstream::in);
+        config = get_json_string(from_bundle);
 
-	/* 'bundle' must be specified for the OCI hooks, and from there we read the configuration file */
-	const char *bundle_path[] = { "bundle", (const char *)0 };
-	yajl_val v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
-	if (!v_bundle_path) {
-		const char *bundle_path[] = { "bundlePath", (const char *)0 };
-		v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
-	}
+        return true;
+}
 
-        fstream config_file;
-        stringstream config_file_name;
+static bool get_rootfs_from_config(const string & config, string & rootfs, const string & bundle)
+{
+        rd::Document doc;
+        doc.Parse(config.c_str());
         
-	if (v_bundle_path) {
-                config_file_name << YAJL_GET_STRING(v_bundle_path) << "/config.json"; 
-                config_file.open(config_file_name.str().c_str(), std::fstream::in);
-	} else {
-		pr_perror("bundle not found in state");
-                return EXIT_FAILURE;
-	}
+        assert(doc.HasMember("root"));
+
+        rd::Value & root = doc["root"];
+
+        assert(root.HasMember("path"));
+        assert(root["path"].IsString());
         
-        pr_pdebug("Reading config file: %s", config_file_name.str().c_str());
-	/* Read the entire config file */
-	config_data = get_json_string(config_file);
+        string rootfs_ = root["path"].GetString();
 
-
-        /* Check for environment flag SOLARFLARE_ONLOAD */
-        size_t found = config_data.find("SOLARFLARE_ONLOAD=true");
-        if (found != string::npos) {
-                pr_pdebug("Found flag, continuing ...");
+        if (rootfs_.compare(0,1,"/") == 0) {
+                rootfs = rootfs_;
         } else {
-                pr_pdebug("SOLARFLARE_ONLOAD flag not found, exiting ... (run -it -e SOLARFLARE_ONLOAD=true )");
-                return EXIT_FAILURE;
+                rootfs.append(bundle).append("/").append(rootfs_);
         }
         
-
-	/* Parse the config file */
-	memset(errbuf, 0, BUFLEN);
-	config_node = yajl_tree_parse(config_data.c_str(), errbuf, sizeof(errbuf));
-        
-	if (config_node == NULL) {
-		if (strlen(errbuf)) {
-			pr_perror("%s: parse error: %s: %s", id.c_str(), config_file_name.str().c_str(), errbuf);
-		} else {
-			pr_perror("%s: parse error: %s: unknown error", id.c_str(), config_file_name.str().c_str());
-		}
-		return EXIT_FAILURE;
-	}
-
-	/* Extract root path from the bundle */
-	const char *root_path[] = { "root", "path", (const char *)0 };
-	yajl_val v_root = yajl_tree_get(config_node, root_path, yajl_t_string);
-	if (!v_root) {
-		pr_perror("%s: root not found in %s", id.c_str(), config_file_name.str().c_str());
-		return EXIT_FAILURE;
-	}
-        string lrootfs = YAJL_GET_STRING(v_root);
-
-	/* Prepend bundle path if the rootfs string is relative */
-	if (lrootfs[0] == '/') {
-		rootfs = lrootfs;
-	} else {
-                stringstream new_rootfs;
-                new_rootfs << YAJL_GET_STRING(v_bundle_path) << "/" << lrootfs;
-		rootfs = new_rootfs.str();
-	}
-
-        
-	return EXIT_SUCCESS;
+	return true;
 }
+
+static bool get_info_from_state(string & id, int32_t & pid, string & bundle)
+{
+	/* Read the entire state from stdin: 
+         * ociVersion, id, pid, root, bundlePath */
+	string state = get_json_string(std::cin);
+
+        rd::Document doc;
+        doc.Parse(state.c_str());
+
+        assert(doc.HasMember("id"));
+        assert(doc["id"].IsString());
+
+        assert(doc.HasMember("pid"));
+        assert(doc["pid"].IsInt());
+
+        id  = doc["id"].GetString();
+        pid = doc["pid"].GetInt();
+
+        assert(doc.HasMember("bundlePath"));
+        assert(doc["bundlePath"].IsString());
+
+        bundle = doc["bundlePath"].GetString();
+
+        return true;
+}
+static bool activation_flag_in_env(const string & config)
+{
+      rd::Document doc;
+      doc.Parse(config.c_str());
+
+      assert(doc.HasMember("process"));
+
+      rd::Value & pro = doc["process"];
+
+      assert(pro.HasMember("env"));
+      assert(pro["env"].IsArray());
+
+      rd::Value & env = pro["env"];
+      
+      for (size_t e = 0; e < env.Size(); e++) 
+              lg << env[e].GetString() << endl;
+      
+      
+
+      return true;
+}
+
+struct oci_config {
+        string version;
+        string log_level;
+        string activation_flag;
+        vector<string> driver_feature;
+        vector<vector<string>>  inventory;
+};
 
 int32_t main(int32_t argc, char *argv[])
 {
+        lg.open("/tmp/oci-log.txt", std::fstream::in | std::fstream::out | std::fstream::app);
         
-	_cleanup_(yajl_tree_freep) yajl_val node = NULL;
-	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
-        
-	char errbuf[BUFLEN];
-	string state_data;
         string id;
+        int32_t pid;
+        string bundle;
+        string config;
 
-	setlogmask(LOG_UPTO(log_level));
-	
-	/* Read the entire state from stdin */
-	state_data = get_json_string(std::cin);
-        
-        memset(errbuf, 0, BUFLEN);
-	node = yajl_tree_parse(state_data.c_str(), errbuf, sizeof(errbuf));
-	if (node == NULL) {
-		if (strlen(errbuf)) {
-			pr_perror("parse_error: %s", errbuf);
-		} else {
-			pr_perror("parse_error: unknown error");
-		}
-		return EXIT_FAILURE;
-	}
-        
-	const char *id_path[] = { "id", (const char *) 0 };
-	yajl_val v_id = yajl_tree_get(node, id_path, yajl_t_string);
-	if (!v_id) {
-		pr_perror("id not found in state");
-		return EXIT_FAILURE;
-	}
-        
-	const string container_id = YAJL_GET_STRING(v_id);
-	id = shortid(container_id).c_str();
-        
-	const char *pid_path[] = { "pid", (const char *) 0 };
-	yajl_val v_pid = yajl_tree_get(node, pid_path, yajl_t_number);
-	if (!v_pid) {
-		pr_perror("%s: pid not found in state", id.c_str());
-		return EXIT_FAILURE;
-	}
-        
-        int32_t target_pid = YAJL_GET_INTEGER(v_pid);
+        assert(setlogmask(LOG_UPTO(log_level)));
+        assert(get_info_from_state(id, pid, bundle));
+        assert(get_config_from_bundle(bundle, config));
 
-
-	/* OCI hooks set target_pid to 0 on poststop, as the container process
-	   already exited.  If target_pid is bigger than 0 then it is a start
-	   hook.
-	   In most cases the calling program should set the environment variable "stage"
-	   like prestart, poststart or poststop.
-	   We also support passing the stage as argv[1],
-	   In certain cases we also support passing of no argv[1], and no environment variable,
-	   then default to prestart if the target_pid != 0, poststop if target_pid == 0.
-	*/
+        if (!activation_flag_in_env(config))
+        {
+                pr_pdebug("prestart not run for this container, check activation flags and set your environment");
+                return EXIT_SUCCESS;
+        }
+        
+        /* OCI hooks set target_pid to 0 on poststop, as the container process
+         * already exited.  If target_pid is bigger than 0 then it is a start
+         * hook.
+         * In most cases the calling program should set the environment variable "stage"
+         * like prestart, poststart or poststop.
+         * We also support passing the stage as argv[1],
+         * In certain cases we also support passing of no argv[1], and no environment variable,
+         * then default to prestart if the target_pid != 0, poststop if target_pid == 0. */
 	char *stage = getenv("stage");
         
 	if (stage == NULL && argc > 2) {
 		stage = argv[1];
 	}
+        
+	if ((stage != NULL && !strcmp(stage, "prestart")) || (argc == 1 && pid)) {
 
-	
-	if ((stage != NULL && !strcmp(stage, "prestart")) || (argc == 1 && target_pid)) {
+                string rootfs;
+		assert(get_rootfs_from_config(config, rootfs, bundle));
 
-                string rootfs; 
-		if (parse_rootfs_from_bundle(id, &node, rootfs) < 0) {
-                        return EXIT_FAILURE;
-                }
-		if (prestart(id, rootfs, target_pid) != 0) {
+        
+/*		if (prestart(id, rootfs, pid) != 0) {
 			return EXIT_FAILURE;
 		}
-                
+*/              
 	} else {
 		pr_pdebug("%s: only runs in prestart stage, ignoring", id.c_str());
 	}
-
+  
 	return EXIT_SUCCESS;
 }
