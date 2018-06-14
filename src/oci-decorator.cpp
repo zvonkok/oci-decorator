@@ -30,7 +30,7 @@
 #include <libconfig.h++>
 
 #include <rapidjson/document.h>
-
+#include <rapidjson/error/en.h>
 #include "oci-decorator.h"
 
 
@@ -405,7 +405,8 @@ static bool get_info_from_state(string & id, int32_t & pid, string & bundle)
 
         return true;
 }
-static bool activation_flag_in_env(const string & config)
+static bool activation_flag_in_env(const string & config,
+                                   const vector<oci_config_> & oci_config)
 {
       rd::Document doc;
       doc.Parse(config.c_str());
@@ -419,21 +420,80 @@ static bool activation_flag_in_env(const string & config)
 
       rd::Value & env = pro["env"];
       
-      for (size_t e = 0; e < env.Size(); e++) 
-              lg << env[e].GetString() << endl;
-      
-      
-
-      return true;
+      for (size_t e = 0; e < env.Size(); e++) {
+              string flag = env[e].GetString();
+              for (auto & o : oci_config) {
+                      size_t found = flag.find(o.activation_flag);
+                      if (found != string::npos) {
+                              lg << "TRUE" << endl;
+                              return true;
+                      }
+              }
+      }
+      return false;
 }
 
-struct oci_config {
-        string version;
-        string log_level;
-        string activation_flag;
-        vector<string> driver_feature;
-        vector<vector<string>>  inventory;
-};
+static bool parse_driver_feature(rd::Value & doc, oci_config_ & oci_config)
+{
+        assert(doc.HasMember("driver_feature"));
+        assert(doc["driver_feature"].IsArray());
+
+        rd::Value & df = doc["driver_feature"];
+
+        for (size_t i = 0; i < df.Size(); i++) {
+                oci_config.driver_feature.push_back(df[i].GetString());
+        }
+        return true;
+}
+
+static bool parse_activation_flag(rd::Value & doc, oci_config_ & oci_config)
+{
+        assert(doc.HasMember("activation_flag"));
+        assert(doc["activation_flag"].IsString());
+
+        oci_config.activation_flag = doc["activation_flag"].GetString();
+}
+
+static bool get_oci_config_definitions(vector<oci_config_> & oci_config)
+{
+        vector<string> configs;
+        read_directory(oci_decorator_conf, configs);
+        
+        for (auto & file : configs) {
+                if (file.compare(".") == 0 || file.compare("..") == 0) { continue; }
+
+                
+                file.insert(0, oci_decorator_conf);
+                fstream f(file.c_str(), fstream::in);
+                string json = get_json_string(f);
+
+                rd::Document doc;
+                doc.Parse(json.c_str());
+//                if (!result) 
+                //                      lg <<  GetParseError_En(result.Code()) << "ofset " <<  result.Offset() << endl;
+        
+                oci_config.push_back(oci_config_());
+ 
+                assert(parse_activation_flag(doc, oci_config.back()));
+                assert(parse_driver_feature(doc, oci_config.back()));
+
+                
+                
+                assert(doc.HasMember("inventory"));
+                rd::Value & inv = doc["inventory"];
+
+                
+                assert(inv.HasMember("common"));
+
+                
+                
+        }
+        
+        
+        
+        return true;
+}
+
 
 int32_t main(int32_t argc, char *argv[])
 {
@@ -442,13 +502,16 @@ int32_t main(int32_t argc, char *argv[])
         string id;
         int32_t pid;
         string bundle;
-        string config;
+        string json_config;
 
         assert(setlogmask(LOG_UPTO(log_level)));
         assert(get_info_from_state(id, pid, bundle));
-        assert(get_config_from_bundle(bundle, config));
+        assert(get_config_from_bundle(bundle, json_config));
 
-        if (!activation_flag_in_env(config))
+        vector<oci_config_> oci_config;
+        assert(get_oci_config_definitions(oci_config));
+        
+        if (!activation_flag_in_env(json_config, oci_config))
         {
                 pr_pdebug("prestart not run for this container, check activation flags and set your environment");
                 return EXIT_SUCCESS;
@@ -471,7 +534,7 @@ int32_t main(int32_t argc, char *argv[])
 	if ((stage != NULL && !strcmp(stage, "prestart")) || (argc == 1 && pid)) {
 
                 string rootfs;
-		assert(get_rootfs_from_config(config, rootfs, bundle));
+		assert(get_rootfs_from_config(json_config, rootfs, bundle));
 
         
 /*		if (prestart(id, rootfs, pid) != 0) {
