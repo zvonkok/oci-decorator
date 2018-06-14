@@ -31,11 +31,12 @@
 
 #define _cleanup_(x) __attribute__((cleanup(x)))
 
+
 static const std::string oci_decorator_conf = "/etc/oci-decorator/oci-decorator.d/";
 
-static int log_level=LOG_DEBUG;
+static int32_t log_level=LOG_DEBUG;
 
-static inline void closep(int *fd) {
+static inline void closep(int32_t *fd) {
 	if (*fd >= 0) {	close(*fd); }
 	*fd = -1;
 }
@@ -65,7 +66,7 @@ DEFINE_CLEANUP_FUNC(yajl_val, yajl_tree_free)
 #define pr_perror(fmt, ...)   syslog(LOG_ERR,     "onload-hook <error>:   " fmt ": %m\n", ##__VA_ARGS__)
 #define pr_pinfo(fmt, ...)    syslog(LOG_INFO,    "onload-hook <info>:    " fmt "\n", ##__VA_ARGS__)
 #define pr_pwarning(fmt, ...) syslog(LOG_WARNING, "onload-hook <warning>: " fmt "\n", ##__VA_ARGS__)
-#define pr_pdebug(fmt, ...)   syslog(LOG_DEBUG,    "onload-hook <debug>:  " fmt "\n", ##__VA_ARGS__)
+#define pr_pdebug(fmt, ...)   syslog(LOG_DEBUG,    "onload-hook <debug> %d :  " fmt "\n", __LINE__,  ##__VA_ARGS__)
 
 #define BUFLEN 1024
 #define CHUNKSIZE 4096
@@ -87,8 +88,13 @@ void read_directory(const string & name, vector<string> & v)
         }
 }
 
-
-static int cp(const string & dst, const string & src)
+long GetFileSize(std::string filename)
+{
+    struct stat stat_buf;
+    int rc = stat(filename.c_str(), &stat_buf);
+    return rc == 0 ? stat_buf.st_size : -1;
+}
+static int32_t cp(const string & dst, const string & src)
 {
         ifstream f_src(src.c_str(), ios::binary);
         ofstream f_dst(dst.c_str(), ios::binary);
@@ -96,7 +102,7 @@ static int cp(const string & dst, const string & src)
         f_dst << f_src.rdbuf();
 }
 
-static int zcopy(const string & dst, const string & src, const string & rootfs)
+static int32_t zcopy(const string & dst, const string & src, const string & rootfs)
 {
         const string file_dst = rootfs + dst;
         
@@ -110,7 +116,7 @@ static int zcopy(const string & dst, const string & src, const string & rootfs)
 	return 0;
 }
 
-static int zmkdir(const string & dst, const string & rootfs)
+static int32_t zmkdir(const string & dst, const string & rootfs)
 {
         
         const string file_dst = rootfs + dst;
@@ -130,7 +136,7 @@ static int zmkdir(const string & dst, const string & rootfs)
 	return 0;
 }
 
-static int zmknod(const string & dev, const int32_t major, const int32_t minor, const string & rootfs)
+static int32_t zmknod(const string & dev, const int32_t major, const int32_t minor, const string & rootfs)
 {
         const string file_dst = rootfs + dev;
         
@@ -151,7 +157,7 @@ static int zmknod(const string & dev, const int32_t major, const int32_t minor, 
 	return 0;
 }
 
-static int zchmod(const string & path, const mode_t mode, const string & rootfs)
+static int32_t zchmod(const string & path, const mode_t mode, const string & rootfs)
 {
         const string file_dst = rootfs + path;
 	chmod(file_dst.c_str(), mode);
@@ -219,7 +225,7 @@ static int32_t prestart(const string & id,
 {
 	pr_pdebug("prestart container_id:%s rootfs:%s", id.c_str(), rootfs.c_str());
         
-        _cleanup_close_  int fd = -1;
+        _cleanup_close_  int32_t fd = -1;
 
         stringstream  proc_ns_mnt;
         proc_ns_mnt << "/proc/" << pid << "/ns/mnt";
@@ -270,7 +276,7 @@ static int32_t prestart(const string & id,
                         for (int32_t inv = 0; inv < group_entries; inv++) {
                                 
                                 const Setting& entry = root["inventory"][inventory_name[inv]];
-                                for (int i = 0; i < entry.getLength(); i++)  {
+                                for (int32_t i = 0; i < entry.getLength(); i++)  {
                                         _cfg[inv].push_back(entry[i]);
                                 }       
                         }
@@ -316,106 +322,27 @@ static int32_t prestart(const string & id,
 
 /*
  * Read the entire content of stream pointed to by 'from' into a buffer in memory.
- * Return a pointer to the resulting NULL-terminated string.
+ * Return the complete json string.
  */
-char *getJSONstring(FILE *from, size_t chunksize, char *msg)
+
+string get_json_string(std::istream& from)
 {
-	struct stat stat_buf;
-	char *err = NULL, *JSONstring = NULL;
-	size_t nbytes, bufsize;
+        string json_string;
+        string input_line;
 
-	if (fstat(fileno(from), &stat_buf) == -1) {
-		err = "fstat failed";
-		goto fail;
-	}
-
-	if (S_ISREG(stat_buf.st_mode)) {
-                
-                pr_pdebug("reg file");
-		/*
-		 * If 'from' is a regular file, allocate a buffer based
-		 * on the file size and read the entire content with a
-		 * single fread() call.
-		 */
-		if (stat_buf.st_size == 0) {
-			err = "is empty";
-			goto fail;
-		}
-
-		bufsize = (size_t)stat_buf.st_size;
-
-		JSONstring = (char *)malloc(bufsize + 1);
-		if (JSONstring == NULL) {
-			err = "failed to allocate buffer";
-			goto fail;
-		}
-
-		nbytes = fread((void *)JSONstring, 1, (size_t)bufsize, from);
-		if (nbytes != (size_t)bufsize) {
-			err = "error encountered on read";
-			goto fail;
-		}
-	} else {
-                pr_pdebug("not reg file");
-
-		/*
-		 * If 'from' is not a regular file, call fread() iteratively
-		 * to read sections of 'chunksize' bytes until EOF is reached.
-		 * Call realloc() during each iteration to expand the buffer
-		 * as needed.
-		 */
-		bufsize = 0;
-
-		for (;;) {
-			JSONstring = (char *)realloc((void *)JSONstring, bufsize + chunksize);
-			if (JSONstring == NULL) {
-				err = "failed to allocate buffer";
-				goto fail;
-			}
-
-			nbytes = fread((void *)&JSONstring[bufsize], 1, (size_t)chunksize, from);
-			bufsize += nbytes;
-
-			if (nbytes != (size_t)chunksize) {
-				if (ferror(from)) {
-					err = "error encountered on read";
-					goto fail;
-				}
-				if (feof(from))
-					break;
-			}
-		}
-
-		if (bufsize == 0) {
-			err = "is empty";
-			goto fail;
-		}
-
-		JSONstring = (char *)realloc((void *)JSONstring, bufsize + 1);
-		if (JSONstring == NULL) {
-			err = "failed to allocate buffer";
-			goto fail;
-		}
-	}
-
-	/* make sure the string is NULL-terminated */
-	JSONstring[bufsize] = 0;
-	return JSONstring;
-fail:
-	free(JSONstring);
-	pr_perror("%s: %s", msg, err);
-	return NULL;
+        while(!from.eof()) {
+                getline(from, input_line);
+                json_string.append(input_line);
+        }
+        return json_string;
 }
 
-static int parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, string & rootfs)
+static int32_t parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, string & rootfs)
 {
 	yajl_val node = *node_ptr;
-	char config_file_name[PATH_MAX];
 	char errbuf[BUFLEN];
-	char *configData;
+	string config_data;
 	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
-
-	_cleanup_fclose_ FILE *fp = NULL;
 
 	/* 'bundle' must be specified for the OCI hooks, and from there we read the configuration file */
 	const char *bundle_path[] = { "bundle", (const char *)0 };
@@ -425,33 +352,41 @@ static int parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, strin
 		v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
 	}
 
+        fstream config_file;
+        stringstream config_file_name;
+        
 	if (v_bundle_path) {
-		snprintf(config_file_name, PATH_MAX, "%s/config.json", YAJL_GET_STRING(v_bundle_path));
-		fp = fopen(config_file_name, "r");
+                config_file_name << YAJL_GET_STRING(v_bundle_path) << "/config.json"; 
+                config_file.open(config_file_name.str().c_str(), std::fstream::in);
 	} else {
-		char msg[] = "bundle not found in state";
-		snprintf(config_file_name, PATH_MAX, "%s", msg);
+		pr_perror("bundle not found in state");
+                return EXIT_FAILURE;
 	}
-
-	if (fp == NULL) {
-		pr_perror("%s: Failed to open config file: %s", id.c_str(), config_file_name);
-		return EXIT_FAILURE;
-	}
-
+        
+        pr_pdebug("Reading config file: %s", config_file_name.str().c_str());
 	/* Read the entire config file */
-	snprintf(errbuf, BUFLEN, "failed to read config data from %s", config_file_name);
-	configData = getJSONstring(fp, (size_t)CHUNKSIZE, errbuf);
-	if (configData == NULL)
-		return EXIT_FAILURE;
+	config_data = get_json_string(config_file);
+
+
+        /* Check for environment flag SOLARFLARE_ONLOAD */
+        size_t found = config_data.find("SOLARFLARE_ONLOAD=true");
+        if (found != string::npos) {
+                pr_pdebug("Found flag, continuing ...");
+        } else {
+                pr_pdebug("SOLARFLARE_ONLOAD flag not found, exiting ... (run -it -e SOLARFLARE_ONLOAD=true )");
+                return EXIT_FAILURE;
+        }
+        
 
 	/* Parse the config file */
 	memset(errbuf, 0, BUFLEN);
-	config_node = yajl_tree_parse((const char *)configData, errbuf, sizeof(errbuf));
+	config_node = yajl_tree_parse(config_data.c_str(), errbuf, sizeof(errbuf));
+        
 	if (config_node == NULL) {
 		if (strlen(errbuf)) {
-			pr_perror("%s: parse error: %s: %s", id.c_str(), config_file_name, errbuf);
+			pr_perror("%s: parse error: %s: %s", id.c_str(), config_file_name.str().c_str(), errbuf);
 		} else {
-			pr_perror("%s: parse error: %s: unknown error", id.c_str(), config_file_name);
+			pr_perror("%s: parse error: %s: unknown error", id.c_str(), config_file_name.str().c_str());
 		}
 		return EXIT_FAILURE;
 	}
@@ -460,7 +395,7 @@ static int parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, strin
 	const char *root_path[] = { "root", "path", (const char *)0 };
 	yajl_val v_root = yajl_tree_get(config_node, root_path, yajl_t_string);
 	if (!v_root) {
-		pr_perror("%s: root not found in %s", id.c_str(), config_file_name);
+		pr_perror("%s: root not found in %s", id.c_str(), config_file_name.str().c_str());
 		return EXIT_FAILURE;
 	}
         string lrootfs = YAJL_GET_STRING(v_root);
@@ -474,32 +409,27 @@ static int parse_rootfs_from_bundle(const string & id, yajl_val *node_ptr, strin
 		rootfs = new_rootfs.str();
 	}
 
-
-	return 0;
+        
+	return EXIT_SUCCESS;
 }
 
-int main(int argc, char *argv[])
+int32_t main(int32_t argc, char *argv[])
 {
+        
 	_cleanup_(yajl_tree_freep) yajl_val node = NULL;
 	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
         
 	char errbuf[BUFLEN];
-	char *stateData;
-	_cleanup_fclose_ FILE *fp = NULL;
+	string state_data;
         string id;
 
 	setlogmask(LOG_UPTO(log_level));
-
+	
 	/* Read the entire state from stdin */
-	snprintf(errbuf, BUFLEN, "failed to read state data from standard input");
-	stateData = getJSONstring(stdin, (size_t)CHUNKSIZE, errbuf);
-	if (stateData == NULL)
-		return EXIT_FAILURE;
-
-
-
+	state_data = get_json_string(std::cin);
+        
         memset(errbuf, 0, BUFLEN);
-	node = yajl_tree_parse((const char *)stateData, errbuf, sizeof(errbuf));
+	node = yajl_tree_parse(state_data.c_str(), errbuf, sizeof(errbuf));
 	if (node == NULL) {
 		if (strlen(errbuf)) {
 			pr_perror("parse_error: %s", errbuf);
@@ -518,7 +448,6 @@ int main(int argc, char *argv[])
         
 	const string container_id = YAJL_GET_STRING(v_id);
 	id = shortid(container_id).c_str();
-
         
 	const char *pid_path[] = { "pid", (const char *) 0 };
 	yajl_val v_pid = yajl_tree_get(node, pid_path, yajl_t_number);
@@ -526,12 +455,9 @@ int main(int argc, char *argv[])
 		pr_perror("%s: pid not found in state", id.c_str());
 		return EXIT_FAILURE;
 	}
-
-
         
-        int target_pid = YAJL_GET_INTEGER(v_pid);
+        int32_t target_pid = YAJL_GET_INTEGER(v_pid);
 
-	pr_pdebug("pid %d", target_pid);
 
 	/* OCI hooks set target_pid to 0 on poststop, as the container process
 	   already exited.  If target_pid is bigger than 0 then it is a start

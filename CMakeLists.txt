@@ -19,14 +19,14 @@ function(enable_cxx_compiler_flag_if_supported flag)
 endfunction()
 
 
-enable_cxx_compiler_flag_if_supported("-std=c++11")
+enable_cxx_compiler_flag_if_supported("-std=gnu++11")
 enable_cxx_compiler_flag_if_supported("-Wall")
 enable_cxx_compiler_flag_if_supported("-Wextra")
 enable_cxx_compiler_flag_if_supported("-pedantic")
 
 
 add_executable(oci-decorator src/oci-decorator.cpp)
-target_link_libraries(oci-decorator yajl libconfig++.so.9)
+target_link_libraries(oci-decorator yajl libconfig++.so)
 
 
 
