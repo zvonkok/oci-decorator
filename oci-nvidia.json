@@ -1,0 +1,29 @@
+{
+    "version": "396.26",
+    "log_level": "LOG_DEBUG",
+    "activation_flag": "OCI_NVIDIA",
+    "driver_feature": ["compute", "utility"],
+
+    "inventory": {
+        "compute": {
+            "devices": ["nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"],
+            "binaries": ["/usr/bin/nvidia-cuda-mps-control", "/usr/bin/nvidia-cuda-ms-server"],
+            "libraries": ["/usr/lib64/nvidia/libcuda.so",
+                          "/usr/lib64/nvidia/libcuda.so.396.26",
+                          "/usr/lib64/nvidia/libnvidia-opencl.so.396.26",
+                          "/usr/lib64/nvidia/libnvidia-ptxjitcompiler.so.396.26",
+                          "/usr/lib64/nvidia/libnvidia-fatbinaryloader.so.396.26",
+                          "/usr/lib64/nvidia/libnvidia-compiler.so.396.26"],
+            "directories": ["/usr/lib64/nvidia"],
+            "miscellaneous": ["/etc/ld.so.conf.d/nvidia-lib64.conf"] 
+        },
+        "utility": {
+            "devices": ["nvidia0", "nvidiactl"],
+            "binaries": ["/usr/bin/nvidia-smi", "/usr/bin/nvidia-debugdump", "/usr/bin/nvidia-presistenced"],
+            "libraries": ["/usr/lib64/nvidia/libnvidia-ml.so.396.26",
+                          "/usr/lib64/nvidia/libnvidia-ml.so",
+                          "/usr/lib64/nvidia/libnvidia-cfg.so.396.26"],
+            "directories": ["/usr/lib64/nvidia"]
+        }
+    }
+}
