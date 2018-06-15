@@ -23,7 +23,8 @@
             "libraries": ["/usr/lib64/nvidia/libnvidia-ml.so.396.26",
                           "/usr/lib64/nvidia/libnvidia-ml.so",
                           "/usr/lib64/nvidia/libnvidia-cfg.so.396.26"],
-            "directories": ["/usr/lib64/nvidia"]
+            "directories": ["/usr/lib64/nvidia"],
+            "miscellaneous": ["/etc/ld.so.conf.d/nvidia-lib64.conf"] 
         }
     }
 }
