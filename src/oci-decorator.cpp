@@ -1,93 +1,36 @@
-
-#include <stdio.h>
-#include <libgen.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <sys/mount.h>
 #include <syslog.h>
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
-#include <dirent.h>
 #include <fcntl.h>
-#include <sched.h>
 #include <unistd.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <linux/limits.h>
-#include <yajl/yajl_tree.h>
-#include <ctype.h>
+#include <dirent.h>
+#include <linux/kdev_t.h>
 
 #include <string>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <regex>
+#include <typeinfo>
 
-#include <sys/types.h>
-#include <dirent.h>
-
-#include <libconfig.h++>
 
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
+
 #include "oci-decorator.h"
-
-
-#define _cleanup_(x) __attribute__((cleanup(x)))
-
 
 static const std::string oci_decorator_conf = "/etc/oci-decorator/oci-decorator.d/";
 
 static int32_t log_level=LOG_DEBUG;
 
-static inline void closep(int32_t *fd) {
-	if (*fd >= 0) {	close(*fd); }
-	*fd = -1;
-}
-
-static inline void fclosep(FILE **fp) {
-	if (*fp) { fclose(*fp); }
-	*fp = NULL;
-}
-
-static inline void closedirp(DIR **dir) {
-	if (*dir) { closedir(*dir); }
-	*dir = NULL;
-}
-
-#define _cleanup_close_ _cleanup_(closep)
-#define _cleanup_dir_ _cleanup_(closedirp)
-#define _cleanup_fclose_ _cleanup_(fclosep)
-
-#define DEFINE_CLEANUP_FUNC(type, func)	      \
-	static inline void func##p(type *p) { \
-		if (*p)                       \
-			func(*p);             \
- 	}                                     \
-
-DEFINE_CLEANUP_FUNC(yajl_val, yajl_tree_free)
-
 #define pr_perror(fmt, ...)   syslog(LOG_ERR,     "onload-hook <error>:   " fmt ": %m\n", ##__VA_ARGS__)
 #define pr_pinfo(fmt, ...)    syslog(LOG_INFO,    "onload-hook <info>:    " fmt "\n", ##__VA_ARGS__)
 #define pr_pwarning(fmt, ...) syslog(LOG_WARNING, "onload-hook <warning>: " fmt "\n", ##__VA_ARGS__)
-#define pr_pdebug(fmt, ...)   syslog(LOG_DEBUG,    "onload-hook <debug> %d :  " fmt "\n", __LINE__,  ##__VA_ARGS__)
+#define pr_pdebug(fmt, ...)   syslog(LOG_DEBUG,   "onload-hook <debug> %d :  " fmt "\n", __LINE__,  ##__VA_ARGS__)
 
-#define BUFLEN 1024
-#define CHUNKSIZE 4096
 
 using namespace std;
-using namespace libconfig;
-
 namespace rd = ::rapidjson;
 
 fstream lg;
-
-
-string shortid(const string & id)
-{
-	return id.substr(0, 12);
-}
 
 void read_directory(const string & name, vector<string> & v)
 {
@@ -99,12 +42,6 @@ void read_directory(const string & name, vector<string> & v)
         closedir(dirp);
 }
 
-long GetFileSize(std::string filename)
-{
-    struct stat stat_buf;
-    int rc = stat(filename.c_str(), &stat_buf);
-    return rc == 0 ? stat_buf.st_size : -1;
-}
 static int32_t cp(const string & dst, const string & src)
 {
         ifstream f_src(src.c_str(), ios::binary);
@@ -174,7 +111,7 @@ static int32_t zchmod(const string & path, const mode_t mode, const string & roo
 	chmod(file_dst.c_str(), mode);
 }
 
-static int32_t get_major_num(string device)
+static bool get_major_minor_from_proc(const string & device, int32_t & major, int32_t & minor)
 {
         string line;
         ifstream pd("/proc/devices");
@@ -186,20 +123,46 @@ static int32_t get_major_num(string device)
                 if (found != string::npos) {
                         istringstream iss(line);
                         vector<string> results((istream_iterator<string>(iss)),
-                                                         istream_iterator<string>());
-
+                                               istream_iterator<string>());
                         /* skip if the device is a prefix of another device */
                         if (device.size() != results[1].size()) {
                                 continue;
                         }
-                        
-                        pr_pdebug("major %s device %s", results[0].c_str(), results[1].c_str());
-                        return stoi(results[0]);
-                }
-                        
 
+                        major = stoi(results[0]);
+                        minor = 0;
+                }
         }
-        return -1;
+        return true;
+}
+
+static bool get_major_minor_from_dev(const string & device, int32_t & major, int32_t & minor)
+{
+        struct stat stat_;
+        string file = "/dev/" + device; 
+        
+        assert(stat(file.c_str(), &stat_) == 0);
+
+        major = MAJOR(stat_.st_rdev);
+        minor = MINOR(stat_.st_rdev);
+
+        return true;
+}
+
+static bool get_major_minor(string device, int32_t & major, int32_t & minor)
+{
+        string line;
+
+        get_major_minor_from_proc(device, major, minor);
+
+        if (major != -1 && major > 0) { return true; }
+
+        get_major_minor_from_dev(device, major, minor);
+
+        assert(major != -1 && major > 0);
+        assert(minor != -1);
+                
+        return true;
 }
 
 
@@ -213,6 +176,7 @@ static string get_device_cgroup(const int32_t pid)
         ifstream ppc(proc_pid_cgroup.str().c_str());
 
         while (getline(ppc, line)) {
+                
                 size_t found = line.find("devices");
 
                 if (found != string::npos) {
@@ -225,110 +189,129 @@ static string get_device_cgroup(const int32_t pid)
                         return cgroup[2];
                 }
         }
-   
+        return string();
 }
 
-
-
-static int32_t prestart(const string & id,
-                        const string & rootfs,
-                        int32_t pid)
+static int32_t zexec(string cmd, string & out)
 {
-	pr_pdebug("prestart container_id:%s rootfs:%s", id.c_str(), rootfs.c_str());
-        
-        _cleanup_close_  int32_t fd = -1;
+        cmd.append(" 2>&1");
+        FILE* file = popen(cmd.c_str(), "r");
+        assert(file);
 
-        stringstream  proc_ns_mnt;
-        proc_ns_mnt << "/proc/" << pid << "/ns/mnt";
-        
-        fd = open(proc_ns_mnt.str().c_str(), O_RDONLY);
+        char line[1024];
+        while (fgets(line, 1024, file)) {
+                out.append(line);
+                out.append("\n");
+        };
+        return pclose(file);
+}
+
+static bool join_pid_namespace(const int32_t pid)
+{
+        int32_t fd = -1;
+        string pidns = "/proc/" + to_string(pid) + "/ns/mnt";
+
+        fd = open(pidns.c_str(), O_RDONLY);
 	if (fd < 0) {
-		pr_perror("%s: Failed to open mnt namespace fd %s", id.c_str(), proc_ns_mnt.str().c_str());
-		return EXIT_FAILURE;
+		pr_perror("Failed to open mnt namespace fd %s", pidns.c_str());
+		return false;
 	}
 	/* Join the mount namespace of the target process */
 	if (setns(fd, 0) == -1) {
-		pr_perror("%s: Failed to setns to %s", id.c_str(), proc_ns_mnt.str().c_str());
-		return EXIT_FAILURE;
+		pr_perror("Failed to setns to %s", pidns.c_str());
+		return false;
 	}
-
-  
-        enum inventory {
-                devices = 0,
-                binaries,
-                directories,
-                libraries,
-                miscellaneous,
-                group_entries
-        };
-
-        string inventory_name[group_entries] = {
-                "devices",
-                "binaries",
-                "directories",
-                "libraries",
-                "miscellaneous"
-        };
-         
-        vector<vector<string>> _cfg(group_entries);
+        close(fd);
         
-        vector<string>  conf_files;
-        read_directory(oci_decorator_conf, conf_files);
-                        
-        Config cfg;        
-        for (auto & file : conf_files) {
-                if (file.compare(".") != 0 && file.compare("..") != 0) {
+        return true;
+}
 
-                        cfg.readFile((oci_decorator_conf + file).c_str());
-                        string name = cfg.lookup("name");
-                        
-                        const Setting& root = cfg.getRoot();
+static bool prepare_container(const int32_t pid, string & device_cgroup)
+{
+        assert(join_pid_namespace(pid));
+        device_cgroup = get_device_cgroup(pid);
+        assert(device_cgroup.size() > 0);
+}
 
-                        for (int32_t inv = 0; inv < group_entries; inv++) {
-                                
-                                const Setting& entry = root["inventory"][inventory_name[inv]];
-                                for (int32_t i = 0; i < entry.getLength(); i++)  {
-                                        _cfg[inv].push_back(entry[i]);
-                                }       
-                        }
-                }
-        }
-
-        
-        string device_cgroup = get_device_cgroup(pid);
-        pr_pdebug("cgroup: %s", device_cgroup.c_str());
-
-        for (auto & dev : _cfg[devices]) {
-                string dev_path = "/dev/" + dev;
-                int32_t major = get_major_num(dev);
+static bool prestart_devices(const string & rootfs, const string & cgroup, vector<string> devices)
+{
+        for (auto & dev : devices) {
+                lg << dev << endl;
+                string path = "/dev/" + dev;
+                int32_t major = -1;
+                int32_t minor = -1;
                 
-                zmknod(dev_path, major, 0, rootfs);
+                get_major_minor(dev, major, minor);
 
-                stringstream allow_device;
-                allow_device << "cgset -r \"devices.allow=c " << major << ":0 rwm\" " << device_cgroup;
-                system(allow_device.str().c_str());
-                pr_pdebug("%s", allow_device.str().c_str());
+                zmknod(path, major, minor, rootfs);
+                stringstream allow;
+                allow << "cgset -r \"devices.allow=c " << major << ":" << minor << " rwm\" " << cgroup;
+
+                string out; 
+                assert(zexec(allow.str(), out) == 0);
         }
-        
-        for (auto & dir : _cfg[directories]) {
-                zmkdir(dir, rootfs);
-        }
-        
-        for (auto & bin : _cfg[binaries]) {
+        return true;
+}
+static bool prestart_binaries(const string & rootfs, vector<string> binaries)
+{
+        for (auto & bin : binaries) {
+                lg << bin << endl;
                 zcopy(bin, bin, rootfs);
                 zchmod(bin,  S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH, rootfs);
         }
-        for (auto & msc : _cfg[miscellaneous]) {
-                zcopy(msc, msc, rootfs);
+        return true;
+}
+
+static bool prestart_directories(const string & rootfs, vector<string> directories)
+{
+        for (auto & dir : directories) {
+                lg << dir << endl;
+                zmkdir(dir, rootfs);
         }
 
-        for (auto & lib : _cfg[libraries]) {
+        return true;
+}
+static bool prestart_libraries(const string & rootfs, vector<string> libraries)
+{
+        for (auto & lib : libraries) {
+                lg << lib << endl;
                 zcopy(lib, lib, rootfs);
         }
 
+        string ldconfig = "PATH=/usr/sbin:/usr/bin:/bin:/sbin chroot ";
+        ldconfig.append(rootfs);
+        ldconfig.append(" ldconfig");
 
+        string out; 
+        assert(zexec(ldconfig, out) == 0);
+
+        return true;
+}
+static bool prestart_miscellaneous(const string & rootfs, vector<string> miscellaneous)
+{
+        for (auto & msc : miscellaneous) {
+                lg << msc << endl;
+                zcopy(msc, msc, rootfs);
+        }
+        return true;
+}
         
-	return 0;
+static bool prestart(const string & rootfs, const string & cgroup,
+                     const oci_config_ & cfg)
+{
+        for (int32_t i = 0; i < cfg.driver_feature.size(); i++) {
+
+                auto & curr = cfg.inventory[i];
+
+                prestart_devices(rootfs, cgroup, curr[inventory::devices]);
+                prestart_directories(rootfs, curr[inventory::directories]);
+                prestart_binaries(rootfs, curr[inventory::binaries]);
+                prestart_libraries(rootfs, curr[inventory::libraries]);
+                prestart_miscellaneous(rootfs, curr[inventory::miscellaneous]);
+                                  
+        }
+
+	return true;
 }
 
 /*
@@ -454,7 +437,42 @@ static bool parse_activation_flag(rd::Value & doc, oci_config_ & oci_config)
         oci_config.activation_flag = doc["activation_flag"].GetString();
 }
 
-static bool get_oci_config_definitions(vector<oci_config_> & oci_config)
+static bool parse_feature_entry(rd::Value & doc, const string & item, vector<string> & entry)
+{
+        if(doc.HasMember(item.c_str())) {
+                rd::Value & arr = doc[item.c_str()];
+                assert(arr.IsArray());
+                for (size_t i = 0; i < arr.Size(); i++)
+                {
+                        entry.push_back(arr[i].GetString());
+                }
+        }
+        return true;
+}
+
+static bool parse_inventory(rd::Value & doc, oci_config_ & cfg)
+{
+        for (int32_t i = 0; i < cfg.driver_feature.size(); i++) {
+                string name = cfg.driver_feature[i];
+                
+                assert(doc.HasMember(name.c_str()));
+                rd::Value & ftr = doc[name.c_str()];
+                
+                cfg.inventory.resize(cfg.driver_feature.size());
+                cfg.inventory[i].resize(inventory::group_entries);
+
+                auto & curr = cfg.inventory[i];
+
+                assert(parse_feature_entry(ftr, "devices", curr[inventory::devices]));
+                assert(parse_feature_entry(ftr, "binaries", curr[inventory::binaries]));
+                assert(parse_feature_entry(ftr, "libraries", curr[inventory::libraries]));
+                assert(parse_feature_entry(ftr, "directories", curr[inventory::directories]));
+                assert(parse_feature_entry(ftr, "miscellaneous", curr[inventory::miscellaneous]));
+        }
+        return true;
+}
+
+static bool get_oci_config_definitions(vector<oci_config_> & cfg)
 {
         vector<string> configs;
         read_directory(oci_decorator_conf, configs);
@@ -468,29 +486,25 @@ static bool get_oci_config_definitions(vector<oci_config_> & oci_config)
                 string json = get_json_string(f);
 
                 rd::Document doc;
-                doc.Parse(json.c_str());
-//                if (!result) 
-                //                      lg <<  GetParseError_En(result.Code()) << "ofset " <<  result.Offset() << endl;
+                rd::ParseResult res = doc.Parse(json.c_str());
+                if (!res) {
+                        auto err =  GetParseError_En(res.Code());
+                        lg << err << endl;
+                        pr_pdebug("%s", err);
+                }
+                assert(res);
         
-                oci_config.push_back(oci_config_());
+                cfg.push_back(oci_config_());
+                auto & curr = cfg.back();
  
-                assert(parse_activation_flag(doc, oci_config.back()));
-                assert(parse_driver_feature(doc, oci_config.back()));
-
-                
+                assert(parse_activation_flag(doc, curr));
+                assert(parse_driver_feature(doc, curr));
                 
                 assert(doc.HasMember("inventory"));
                 rd::Value & inv = doc["inventory"];
 
-                
-                assert(inv.HasMember("common"));
-
-                
-                
+                assert(parse_inventory(inv, curr));
         }
-        
-        
-        
         return true;
 }
 
@@ -536,11 +550,14 @@ int32_t main(int32_t argc, char *argv[])
                 string rootfs;
 		assert(get_rootfs_from_config(json_config, rootfs, bundle));
 
+                string device_cgroup;
+                assert(prepare_container(pid, device_cgroup));
+                pr_pdebug("prestart container_id:%s rootfs:%s", id.c_str(), rootfs.c_str());
+                
+                for (int32_t i = 0; i < oci_config.size(); i++) {
+                        assert(prestart(rootfs, device_cgroup, oci_config[i]));
+                }
         
-/*		if (prestart(id, rootfs, pid) != 0) {
-			return EXIT_FAILURE;
-		}
-*/              
 	} else {
 		pr_pdebug("%s: only runs in prestart stage, ignoring", id.c_str());
 	}
